@@ -1,11 +1,18 @@
 from functools import partial
 
 import torch
-import torch.nn as nn
+from torch import Tensor, nn
 
 
 class ToeplitzLinear(nn.Conv1d):
-    def __init__(self, in_features, out_features):
+    """ToeplitzLinear, implemented by c1c1 Conv1d."""
+    def __init__(self, in_features: int, out_features: int):
+        """
+        Args:
+            in_features  - Frequency dimension size of input
+            out_channels - Frequency dimension size of output
+        """
+
         super(ToeplitzLinear, self).__init__(
             in_channels=1,
             out_channels=1,
@@ -14,29 +21,15 @@ class ToeplitzLinear(nn.Conv1d):
             bias=False
         )
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: Tensor) -> Tensor:
+        """ :: (B, Freq=i) -> (B, 1, Freq=i) -> (B, 1, Freq=o) -> (B, Freq=o)"""
         return super(ToeplitzLinear, self).forward(input.unsqueeze(-2)).squeeze(-2)
 
 
 class PESTOEncoder(nn.Module):
     """
-    Basic CNN similar to the one in Johannes Zeitler's report,
-    but for longer HCQT input (always stride 1 in time)
+    Basic CNN similar to the one in Johannes Zeitler's report, but for longer HCQT input
     Still with 75 (-1) context frames, i.e. 37 frames padded to each side
-    The number of input channels, channels in the hidden layers, and output
-    dimensions (e.g. for pitch output) can be parameterized.
-    Layer normalization is only performed over frequency and channel dimensions,
-    not over time (in order to work with variable length input).
-    Outputs one channel with sigmoid activation.
-
-    Args (Defaults: BasicCNN by Johannes Zeitler but with 1 input channel):
-        n_chan_layers:    Number of channels in the hidden layers (list)
-        n_prefilt_layers: Number of repetitions of the prefiltering layer
-        residual:         If True, use residual connections for prefiltering (default: False)
-        n_bins_in:        Number of input bins (12 * number of octaves)
-        n_bins_out:       Number of output bins (12 for pitch class, 72 for pitch, num_octaves * 12)
-        a_lrelu:          alpha parameter (slope) of LeakyReLU activation function
-        p_dropout:        Dropout probability
     """
 
     def __init__(
@@ -48,91 +41,80 @@ class PESTOEncoder(nn.Module):
             output_dim=128,
             num_output_layers: int = 1
     ):
-        super(PESTOEncoder, self).__init__()
+        """
+        Args (Defaults: BasicCNN by Johannes Zeitler but with 1 input channel):
+            n_chan_layers     - Feature dimension sizes of hidden layers. In official PESTO paper, `(40, 30, 30, 10, 3)`
+            n_prefilt_layers  - The number of prefiltering layer.         In official PESTO paper, `2`
+            residual          - Deprecated.
+            n_bins_in         - Feature dimension size of input.          In official PESTO paper,  `88*bins_per_semitone`==` 88*3`
+            output_dim        - Feature dimension size of output.         In official PESTO paper, `128*bins_per_semitone`==`128*3`
+            num_output_layers - pre_fc's parameter
+        
+        NOTE: n_bins_in is (12 * number of octaves), n_bins_out is (12 for pitch class, 72 for pitch, num_octaves * 12)
+        """
+        super().__init__()
+
+        assert residual, "Support only 'residual' mode."
 
         activation_layer = partial(nn.LeakyReLU, negative_slope=0.3)
 
+        # Feature dimension size of hidden layers : tuple[int, int, int, int, int] = (40, 30, 30, 10, 3) in official PESTO
         n_ch = n_chan_layers
         if len(n_ch) < 5:
             n_ch.append(1)
 
-        # Layer normalization over frequency
+        # Norm - LN
         self.layernorm = nn.LayerNorm(normalized_shape=[1, n_bins_in])
-
         # Prefiltering
-        self.conv1 = nn.Sequential(
-            nn.Conv1d(in_channels=1, out_channels=n_ch[0], kernel_size=15, padding=7, stride=1),
-            activation_layer()
-        )
+        ## conv1 - Conv1d_k15s1same-LReLU
+        self.conv1 = nn.Sequential(nn.Conv1d(in_channels=1, out_channels=n_ch[0], kernel_size=15, padding=7, stride=1), activation_layer())
+        ## prefilt_list - [Conv1d_k15s1same-LReLU]x1
         self.n_prefilt_layers = n_prefilt_layers
         self.prefilt_list = nn.ModuleList()
         for p in range(1, n_prefilt_layers):
-            self.prefilt_list.append(nn.Sequential(
-                nn.Conv1d(in_channels=n_ch[0], out_channels=n_ch[0], kernel_size=15, padding=7, stride=1),
-                activation_layer()
-            ))
-        self.residual = residual
-
-        self.conv2 = nn.Sequential(
-            nn.Conv1d(
-                in_channels=n_ch[0],
-                out_channels=n_ch[1],
-                kernel_size=1,
-                stride=1,
-                padding=0
-            ),
-            activation_layer()
-        )
-
-        self.conv3 = nn.Sequential(
-            nn.Conv1d(in_channels=n_ch[1], out_channels=n_ch[2], kernel_size=1, padding=0, stride=1),
-            activation_layer()
-        )
-
-        self.conv4 = nn.Sequential(
-            nn.Conv1d(in_channels=n_ch[2], out_channels=n_ch[3], kernel_size=1, padding=0, stride=1),
-            activation_layer(),
-            nn.Dropout(),
-            nn.Conv1d(in_channels=n_ch[3], out_channels=n_ch[4], kernel_size=1, padding=0, stride=1)
-        )
+            self.prefilt_list.append(nn.Sequential(nn.Conv1d(in_channels=n_ch[0], out_channels=n_ch[0], kernel_size=15, padding=7, stride=1), activation_layer()))
+        # SegFC-LReLU / SegFC-LReLU / SegFC-LReLU-Do-SegFC
+        self.conv2 = nn.Sequential(nn.Conv1d(in_channels=n_ch[0], out_channels=n_ch[1], kernel_size=1, stride=1, padding=0), activation_layer())
+        self.conv3 = nn.Sequential(nn.Conv1d(in_channels=n_ch[1], out_channels=n_ch[2], kernel_size=1, stride=1, padding=0), activation_layer())
+        self.conv4 = nn.Sequential(nn.Conv1d(in_channels=n_ch[2], out_channels=n_ch[3], kernel_size=1, padding=0, stride=1), activation_layer(),
+            nn.Dropout(), nn.Conv1d(in_channels=n_ch[3], out_channels=n_ch[4], kernel_size=1, padding=0, stride=1))
 
         self.flatten = nn.Flatten(start_dim=1)
 
-        layers = []
+        # Flatten dim - Freq * Channel
         pre_fc_dim = n_bins_in * n_ch[4]
+
+        # pre_fc - Not used (just Identity)
+        layers = []
         for i in range(num_output_layers-1):
             layers.extend([
                 ToeplitzLinear(pre_fc_dim, pre_fc_dim),
                 activation_layer()
             ])
         self.pre_fc = nn.Sequential(*layers)
-        self.fc = ToeplitzLinear(pre_fc_dim, output_dim)
 
+        # ToeplitzLinear/Softmax
+        self.fc = ToeplitzLinear(pre_fc_dim, output_dim)
         self.final_norm = nn.Softmax(dim=-1)
 
         self.register_buffer("abs_shift", torch.zeros((), dtype=torch.long), persistent=True)
 
     def forward(self, x):
-        r"""
+        """Frame-wise pitch prediction.
 
         Args:
-            x (torch.Tensor): shape (batch, channels, freq_bins)
+            x :: (B, 1, Freq=i) - CQT
+        Returns:
+              :: (B, Freq=o)    - Pitch probability distribution
         """
-        x_norm = self.layernorm(x)
 
-        x = self.conv1(x_norm)
+        # LN-Conv-LReLU-Res[Conv-LReLU]-[SegFC-LReLU]x3-Do-SegFC :: (B, 1, Freq=i) -> (B, Feat=c, Freq=i)
+        x = self.conv1(self.layernorm(x))
         for p in range(0, self.n_prefilt_layers - 1):
-            prefilt_layer = self.prefilt_list[p]
-            if self.residual:
-                x_new = prefilt_layer(x)
-                x = x_new + x
-            else:
-                x = prefilt_layer(x)
-        conv2_lrelu = self.conv2(x)
-        conv3_lrelu = self.conv3(conv2_lrelu)
+            x = x + self.prefilt_list[p](x)
+        y_pred = self.conv4(self.conv3(self.conv2(x)))
 
-        y_pred = self.conv4(conv3_lrelu)
-        y_pred = self.flatten(y_pred)
-        y_pred = self.pre_fc(y_pred)
-        y_pred = self.fc(y_pred)
-        return self.final_norm(y_pred)
+        # Flatten-TeplitzLinear-Softmax :: (B, Feat=c, Freq=i) -> (B, Freq=c*i) -> (B, Freq=o) -> (B, Freq=o)
+        dist = self.final_norm(self.fc(self.pre_fc(self.flatten(y_pred))))
+
+        return dist

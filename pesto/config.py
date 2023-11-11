@@ -8,6 +8,7 @@ if center_bins:
     fmin = fmin / (2 ** ((bins_per_semitone - 1) / (12 * bins_per_semitone)))
 
 
+# PESTO cqt-to-dist NN parameters
 model_args = dict(
     n_chan_layers=(40, 30, 30, 10, 3),
     n_prefilt_layers=2,
@@ -17,6 +18,7 @@ model_args = dict(
 )
 
 
+# PESTO wave-to-cqt DSP parameters
 cqt_args = dict(
     bins_per_semitone=bins_per_semitone,
     fmin=fmin,

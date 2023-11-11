@@ -1,8 +1,9 @@
 import os
 import warnings
-from typing import Optional, Sequence, Union
+from typing import Sequence
 
 import torch
+from torch import Tensor, nn
 import torchaudio
 from tqdm import tqdm
 
@@ -12,40 +13,36 @@ from .export import export
 
 @torch.inference_mode()
 def predict(
-        x: torch.Tensor,
-        sr: Optional[int] = None,
-        model: Union[torch.nn.Module, str] = "mir-1k",
-        data_preprocessor=None,
-        step_size: Optional[float] = None,
-        reduction: str = "argmax",
-        num_chunks: int = 1,
-        convert_to_freq: bool = False
+        x:                Tensor,
+        sr:               int | None      = None,
+        model:            nn.Module | str = "mir-1k",
+        data_preprocessor                 = None,
+        step_size:        float | None    = None,
+        reduction:        str             = "argmax",
+        num_chunks:       int             = 1,
+        convert_to_freq:  bool            = False
 ):
-    r"""Main prediction function.
+    """Main prediction function.
 
     Args:
-        x (torch.Tensor): input audio tensor,
-            shape (num_channels, num_samples) or (batch_size, num_channels, num_samples)
-        sr (int, optional): sampling rate. If not specified, uses the current sampling rate of the model.
-        model: PESTO model. If a string is passed, it will load the model with the corresponding name.
-            Otherwise, the actual nn.Module will be used for doing predictions.
-        data_preprocessor: Module handling the data processing pipeline (waveform to CQT, cropping, etc.)
-        step_size (float, optional): step size between each CQT frame in milliseconds.
-            If the data_preprocessor is passed, its value will be used instead.
+        x :: (C, T) | (B, C, T) - Audio
+        sr                      - sampling rate. If not specified, uses the current sampling rate of the model.
+        model                   - PESTO model instance | model name specifier
+        data_preprocessor       - Module handling the data processing pipeline (waveform to CQT, cropping, etc.)
+        step_size               - CQT hop size [msec], used when `data_processor` is None
         reduction (str): reduction method for converting activation probabilities to log-frequencies.
-        num_chunks (int): number of chunks to split the input audios in.
-            Default is 1 (all CQT frames in parallel) but it can be increased to reduce memory usage
-            and prevent out-of-memory errors.
+        num_chunks              - number of chunks to split the input audios in. Default is 1 (all CQT frames in parallel) but it can be increased to reduce memory usage and prevent out-of-memory errors.
         convert_to_freq (bool): whether predictions should be converted to frequencies or not.
     """
-    # convert to mono
+
     assert 2 <= x.ndim <= 3, f"Audio file should have two dimensions, but found shape {x.size()}"
+
+    # convert to mono :: (C, T) | (B, C, T) -> (T,) | (B, T)
     batch_size = x.size(0) if x.ndim == 3 else None
     x = x.mean(dim=-2)
 
     if data_preprocessor is None:
-        assert step_size is not None, \
-            "If you don't use a predefined data preprocessor, you must at least indicate a step size (in milliseconds)"
+        assert step_size is not None, "If you don't use a predefined data preprocessor, you must at least indicate a step size (in milliseconds)"
         data_preprocessor = load_dataprocessor(step_size=step_size / 1000., device=x.device)
 
     # If the sampling rate has changed, change the sampling rate accordingly
@@ -55,12 +52,11 @@ def predict(
     if isinstance(model, str):
         model = load_model(model, device=x.device)
 
-    # apply model
+    # Wave-to-CQT :: (T,) | (B, T) -> (B=b*frm, 1, Freq)
     cqt = data_preprocessor(x)
     try:
-        activations = torch.cat([
-            model(chunk) for chunk in cqt.chunk(chunks=num_chunks)
-        ])
+        # CQT-to-Dist :: (B=b*frm/chunk, 1, Freq=i) x chunk -> (B=b*frm/chunk, Freq=o) x chunk -> (B=b*frm, Freq=o)
+        activations = torch.cat([model(chunk) for chunk in cqt.chunk(chunks=num_chunks)])
     except torch.cuda.OutOfMemoryError:
         raise torch.cuda.OutOfMemoryError("Got an out-of-memory error while performing pitch estimation. "
                                           "Please increase the number of chunks with option `-c`/`--chunks` "
@@ -70,7 +66,7 @@ def predict(
         total_batch_size, num_predictions = activations.size()
         activations = activations.view(batch_size, total_batch_size // batch_size, num_predictions)
 
-    # shift activations as it should (PESTO predicts pitches up to an additive constant)
+    # shift activations as it should (PESTO predicts pitches up to an additive constant) NOTE: Not used? (seems to be zero roll)
     activations = activations.roll(model.abs_shift.cpu().item(), dims=-1)
 
     # convert model predictions to pitch values
@@ -89,23 +85,23 @@ def predict(
 
 
 def predict_from_files(
-        audio_files: Union[str, Sequence[str]],
-        model_name: str = "mir-1k",
-        output: Optional[str] = None,
-        step_size: float = 10.,
-        reduction: str = "alwa",
-        export_format: Sequence[str] = ("csv",),
-        no_convert_to_freq: bool = False,
-        num_chunks: int = 1,
-        gpu: int = -1
+        audio_files:        str | Sequence[str],
+        model_name:         str           = "mir-1k",
+        output:             str | None    = None,
+        step_size:          float         = 10.,
+        reduction:          str           = "alwa",
+        export_format:      Sequence[str] = ("csv",),
+        no_convert_to_freq: bool          = False,
+        num_chunks:         int           = 1,
+        gpu:                int           = -1,
 ):
-    r"""
+    """
 
     Args:
-        audio_files: audio files to process
-        model_name: name of the model. Currently only `mir-1k` is supported.
-        output:
-        step_size: hop length in milliseconds
+        audio_files - audio files to process
+        model_name  - name of the model. Currently only `mir-1k` is supported.
+        output
+        step_size   - CQT hop size [msec]
         reduction:
         export_format:
         no_convert_to_freq: whether convert output values to Hz or keep fractional MIDI pitches
@@ -114,6 +110,8 @@ def predict_from_files(
     Returns:
         Pitch predictions, see `predict` for more details.
     """
+
+    # Cast :: str | Sequence[str] -> Sequence[str]
     if isinstance(audio_files, str):
         audio_files = [audio_files]
 
@@ -122,24 +120,21 @@ def predict_from_files(
         gpu = -1
     device = torch.device(f"cuda:{gpu:d}" if gpu >= 0 else "cpu")
 
-    # define data preprocessing
+    # Instantiation
     data_preprocessor = load_dataprocessor(step_size / 1000., device=device)
-
-    # define model
     model = load_model(model_name, device=device)
-    predictions = None
 
+    predictions = None
     pbar = tqdm(audio_files)
     for file in pbar:
         pbar.set_description(file)
 
-        # load audio file
+        # load audio file :: -> (Channel, Time)
         try:
             x, sr = torchaudio.load(file)
         except Exception as e:
             print(e, f"Skipping {file}...")
             continue
-
         x = x.to(device)
 
         # compute the predictions

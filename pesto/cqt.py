@@ -10,26 +10,31 @@ import warnings
 from scipy.signal import get_window
 
 import torch
-import torch.nn as nn
+from torch import Tensor, nn
 import torch.nn.functional as F
 
 
 def broadcast_dim(x):
-    """
-    Auto broadcast input so that it can fits into a Conv1d
+    """Auto broadcast input so that it can fits into a Conv1d.
+    
+    Args:
+        x :: (T,) | (B=b, T) | (B=b, C=c, T) - Input
+    Returns:
+          :: (B=1|b, C=1|c, T)               - Broadcasted output
     """
 
+    # :: (B=b, T) -> (B=b, C=1, T)
     if x.dim() == 2:
         x = x[:, None, :]
+    # :: (T,) -> (B=1, C=1, T)
     elif x.dim() == 1:
-        # If nn.DataParallel is used, this broadcast doesn't work
         x = x[None, None, :]
+    # :: (B=b, C=c, T) -> (B=b, C=c, T)
     elif x.dim() == 3:
         pass
     else:
-        raise ValueError(
-            "Only support input with shape = (batch, len) or shape = (len)"
-        )
+        raise ValueError("Only support input with shape = (batch, len) or shape = (len)")
+
     return x
 
 
@@ -152,20 +157,13 @@ def create_cqt_kernels(
 
 
 class CQT(nn.Module):
-    """This function is to calculate the CQT of the input signal.
-    Input signal should be in either of the following shapes.\n
-    1. ``(len_audio)``\n
-    2. ``(num_audio, len_audio)``\n
-    3. ``(num_audio, 1, len_audio)``
+    """Calculate CQT.
 
-    The correct shape will be inferred autommatically if the input follows these 3 shapes.
     Most of the arguments follow the convention from librosa.
-    This class inherits from ``nn.Module``, therefore, the usage is same as ``nn.Module``.
 
-    This alogrithm uses the method proposed in [1]. I slightly modify it so that it runs faster
-    than the original 1992 algorithm, that is why I call it version 2.
-    [1] Brown, Judith C.C. and Miller Puckette. “An efficient algorithm for the calculation of a
-    constant Q transform.” (1992).
+    This alogrithm uses the method proposed in [1].
+    I slightly modify it so that it runs faster than the original 1992 algorithm, that is why I call it version 2.
+    [1] Brown, Judith C.C. and Miller Puckette. “An efficient algorithm for the calculation of a constant Q transform.” (1992).
 
     Parameters
     ----------
@@ -222,20 +220,6 @@ class CQT(nn.Module):
         will also be caluclated and the CQT kernels will be updated during model training.
         Default value is ``False``.
 
-    output_format : str
-        Determine the return type.
-        ``Magnitude`` will return the magnitude of the STFT result, shape = ``(num_samples, freq_bins,time_steps)``;
-        ``Complex`` will return the STFT result in complex number, shape = ``(num_samples, freq_bins,time_steps, 2)``;
-        ``Phase`` will return the phase of the STFT reuslt, shape = ``(num_samples, freq_bins,time_steps, 2)``.
-        The complex number is stored as ``(real, imag)`` in the last axis. Default value is 'Magnitude'.
-
-    Returns
-    -------
-    spectrogram : torch.Tensor
-    It returns a tensor of spectrograms.
-    shape = ``(num_samples, freq_bins,time_steps)`` if ``output_format='Magnitude'``;
-    shape = ``(num_samples, freq_bins,time_steps, 2)`` if ``output_format='Complex' or 'Phase'``;
-
     Examples
     --------
     >>> spec_layer = CQT()
@@ -270,16 +254,13 @@ class CQT(nn.Module):
         # creating kernels for CQT
         Q = float(filter_scale) / (2 ** (1 / bins_per_octave) - 1)
 
-        cqt_kernels, self.kernel_width, lenghts, freqs = create_cqt_kernels(
-            Q, sr, fmin, n_bins, bins_per_octave, norm, window, fmax
-        )
+        cqt_kernels, self.kernel_width, lenghts, freqs = create_cqt_kernels(Q, sr, fmin, n_bins, bins_per_octave, norm, window, fmax)
 
         self.register_buffer("lenghts", lenghts)
         self.frequencies = freqs
 
         cqt_kernels_real = torch.tensor(cqt_kernels.real).unsqueeze(1)
         cqt_kernels_imag = torch.tensor(cqt_kernels.imag).unsqueeze(1)
-
         if trainable:  # NOTE: can't it be factorized?
             cqt_kernels_real = nn.Parameter(cqt_kernels_real, requires_grad=trainable)
             cqt_kernels_imag = nn.Parameter(cqt_kernels_imag, requires_grad=trainable)
@@ -289,46 +270,48 @@ class CQT(nn.Module):
             self.register_buffer("cqt_kernels_real", cqt_kernels_real)
             self.register_buffer("cqt_kernels_imag", cqt_kernels_imag)
 
-    def forward(self, x, output_format=None, normalization_type="librosa"):
+    def forward(self, x, output_format=None, normalization_type: str = "librosa") -> Tensor:
         """
         Convert a batch of waveforms to CQT spectrograms.
 
         Parameters
         ----------
-        x : torch tensor
-            Input signal should be in either of the following shapes.\n
-            1. ``(len_audio)``\n
-            2. ``(num_audio, len_audio)``\n
-            3. ``(num_audio, 1, len_audio)``
-            It will be automatically broadcast to the right shape
-
-        normalization_type : str
-            Type of the normalization. The possible options are: \n
-            'librosa' : the output fits the librosa one \n
+        x :: (T,) | (B, T) | (B, C=1, T) - Waveforms
+        normalization_type               - Type of the normalization. The possible options are: \n
+            'librosa'       : the output fits the librosa one \n
             'convolutional' : the output conserves the convolutional inequalities of the wavelet transform:\n
             for all p ϵ [1, inf] \n
                 - || CQT ||_p <= || f ||_p || g ||_1 \n
                 - || CQT ||_p <= || f ||_1 || g ||_p \n
-                - || CQT ||_2 = || f ||_2 || g ||_2 \n
-            'wrap' : wraps positive and negative frequencies into positive frequencies. This means that the CQT of a
-            sinus (or a cosine) with a constant amplitude equal to 1 will have the value 1 in the bin corresponding to
-            its frequency.
+                - || CQT ||_2  = || f ||_2 || g ||_2 \n
+            'wrap'          : wraps positive and negative frequencies into positive frequencies. This means that the CQT of a
+            sinus (or a cosine) with a constant amplitude equal to 1 will have the value 1 in the bin corresponding to its frequency.
+        Returns
+        -------
+          :: (B, Freq, Frame) | (B, Freq, Frame, ReIm=2) - Spectrogram, shape is former if `output_format=='Magnitude'`, later if `output_format=='Complex'` or `=='Phase'`
+        
+        
+
         """
+
         output_format = output_format or self.output_format
 
+        # Reshape :: (T,) | (B, T) | (B, C=1, T) -> (B, C=1, T) - As 3D input
         x = broadcast_dim(x)
+
+        # Centering
         if self.center:
             if self.pad_mode == "constant":
                 padding = nn.ConstantPad1d(self.kernel_width // 2, 0)
             elif self.pad_mode == "reflect":
                 padding = nn.ReflectionPad1d(self.kernel_width // 2)
-
             x = padding(x)
 
-        # CQT
-        CQT_real = F.conv1d(x, self.cqt_kernels_real, stride=self.hop_length)
-        CQT_imag = -F.conv1d(x, self.cqt_kernels_imag, stride=self.hop_length)
+        # CQT :: (B, C=1, T) -> (B, C, Frame)
+        CQT_real =  F.conv1d(x, self.cqt_kernels_real, stride=self.hop_length) # bias=None, padding=0
+        CQT_imag = -F.conv1d(x, self.cqt_kernels_imag, stride=self.hop_length) # bias=None, padding=0
 
+        # Normalization
         if normalization_type == "librosa":
             CQT_real *= torch.sqrt(self.lenghts.view(-1, 1))
             CQT_imag *= torch.sqrt(self.lenghts.view(-1, 1))
@@ -338,10 +321,7 @@ class CQT(nn.Module):
             CQT_real *= 2
             CQT_imag *= 2
         else:
-            raise ValueError(
-                "The normalization_type %r is not part of our current options."
-                % normalization_type
-            )
+            raise ValueError(f"The normalization_type {normalization_type} is not part of our current options.")
 
         if output_format == "Magnitude":
             margin = 1e-8 if self.trainable else 0

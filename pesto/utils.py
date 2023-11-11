@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 
 import torch
 
@@ -8,11 +7,18 @@ from .data import DataProcessor
 from .model import PESTOEncoder
 
 
-def load_dataprocessor(step_size, device: Optional[torch.device] = None):
+def load_dataprocessor(step_size: float, device: torch.device | None = None) -> DataProcessor:
+    """Instantiate the `DataProcessor` on device.
+    
+    Args:
+        step_size - CQT hop size [sec]
+    """
     return DataProcessor(step_size=step_size, device=device, **cqt_args).to(device)
 
 
-def load_model(model_name: str, device: Optional[torch.device] = None) -> PESTOEncoder:
+def load_model(model_name: str, device: torch.device | None = None) -> PESTOEncoder:
+    """Instantiate the `PESTOEncoder` on device with pretrained weight."""
+
     model = PESTOEncoder(**model_args).to(device)
     model.eval()
 
